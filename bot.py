@@ -1,7 +1,8 @@
 # bot.py
 
 from __future__ import annotations
-
+import time
+import requests
 import asyncio
 import threading
 import uuid
@@ -55,7 +56,46 @@ worker_pool = ThreadPoolExecutor(max_workers=6, thread_name_prefix="fridae-worke
 
 _started = False
 _start_lock = threading.Lock()
+_keep_alive_thread: threading.Thread | None = None
 
+
+def _keep_alive() -> None:
+    """Keep the Render free instance awake."""
+    # Render exposes PORT to the application.
+    port = 10000
+
+    while True:
+        try:
+            response = requests.get(
+                f"http://127.0.0.1:{port}/health",
+                timeout=10,
+            )
+            log_event(
+                "keep_alive",
+                status_code=response.status_code,
+            )
+        except Exception as exc:
+            log_event(
+                "keep_alive_error",
+                error=type(exc).__name__,
+            )
+
+        # Ping every 10 minutes.
+        time.sleep(600)
+
+
+def start_keep_alive_once() -> None:
+    global _keep_alive_thread
+
+    if _keep_alive_thread and _keep_alive_thread.is_alive():
+        return
+
+    _keep_alive_thread = threading.Thread(
+        target=_keep_alive,
+        name="fridae-keep-alive",
+        daemon=True,
+    )
+    _keep_alive_thread.start()
 
 class DebugRequest(BaseModel):
     question: str
@@ -322,12 +362,14 @@ def start_telegram_once() -> None:
         _started = True
 
 
+
 @app.on_event("startup")
 async def startup_event() -> None:
     start_telegram_once()
+    start_keep_alive_once()
+
     removed = artifact_manager.cleanup_expired()
     log_event("artifact_cleanup", removed=removed)
-
 
 @app.on_event("shutdown")
 async def shutdown_event() -> None:
