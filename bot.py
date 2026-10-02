@@ -10,7 +10,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, Header, HTTPException
+from fastapi import FastAPI, File, Header, HTTPException, UploadFile
 from fastapi.responses import FileResponse, PlainTextResponse
 from pydantic import BaseModel
 from telegram import Update
@@ -101,6 +101,9 @@ class DebugRequest(BaseModel):
     question: str
     chat_id: str = "debug"
 
+class ChatRequest(BaseModel):
+    question: str
+    chat_id: str = "web"
 
 def _answer_from_state(state: dict[str, Any]) -> str:
     answer = str(state.get("answer", "") or "").strip()
@@ -386,6 +389,9 @@ async def health() -> dict[str, Any]:
     return {"status": "ok", "telegram_started": _started and telegram_application is not None}
 
 
+def _require_eval_token(x_eval_token: str | None) -> None:
+    if not EVAL_TOKEN or x_eval_token != EVAL_TOKEN:
+        raise HTTPException(status_code=401, detail="Unauthorized")
 @app.get("/run.jsonl")
 async def run_log(x_eval_token: str | None = Header(default=None)) -> FileResponse:
     if not EVAL_TOKEN or x_eval_token != EVAL_TOKEN:
@@ -411,3 +417,129 @@ async def debug_ask(request: DebugRequest, x_eval_token: str | None = Header(def
 @app.get("/robots.txt", response_class=PlainTextResponse)
 async def robots() -> str:
     return "User-agent: *\nDisallow: /debug/\nDisallow: /run.jsonl\n"
+
+@app.post("/api/chat")
+async def api_chat(
+    request: ChatRequest,
+    x_eval_token: str | None = Header(default=None),
+):
+    _require_eval_token(x_eval_token)
+
+    question = request.question.strip()
+
+    if not question:
+        raise HTTPException(status_code=400, detail="Question cannot be empty.")
+
+    result = await _handle_text(str(request.chat_id), question)
+
+    return {
+        "answer": result["answer"],
+        "artifacts": result.get("artifacts", []),
+        "run_id": result.get("run_id"),
+    }
+
+@app.post("/api/upload")
+async def api_upload(
+    file: UploadFile = File(...),
+    chat_id: str = "web",
+    x_eval_token: str | None = Header(default=None),
+):
+    _require_eval_token(x_eval_token)
+
+    data = await file.read()
+
+    if len(data) > MAX_UPLOAD_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail="Uploaded file is too large.",
+        )
+
+    filename = file.filename or "uploaded_dataset"
+
+    try:
+        info = dataset_manager.register_bytes(
+            chat_id=str(chat_id),
+            filename=filename,
+            data=data,
+            content_type=file.content_type,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        log_event(
+            "web_dataset_upload_error",
+            chat_id=str(chat_id),
+            filename=filename,
+            error=type(exc).__name__,
+        )
+        raise HTTPException(
+            status_code=500,
+            detail="Could not load the dataset.",
+        ) from exc
+
+    return {
+        "dataset": {
+            "chat_id": info.chat_id,
+            "original_name": info.original_name,
+            "format": info.format,
+            "profile": info.profile,
+            "size_bytes": info.size_bytes,
+            "created_at": info.created_at,
+        }
+    }
+
+@app.get("/api/dataset")
+async def api_dataset(
+    chat_id: str = "web",
+    x_eval_token: str | None = Header(default=None),
+):
+    _require_eval_token(x_eval_token)
+
+    info = dataset_manager.get(str(chat_id))
+
+    if info is None:
+        return {"dataset": None}
+
+    return {
+        "dataset": {
+            "chat_id": info.chat_id,
+            "original_name": info.original_name,
+            "format": info.format,
+            "profile": info.profile,
+            "size_bytes": info.size_bytes,
+            "created_at": info.created_at,
+        }
+    }
+
+@app.get("/api/artifacts")
+async def api_artifacts(
+    chat_id: str = "web",
+    x_eval_token: str | None = Header(default=None),
+):
+    _require_eval_token(x_eval_token)
+
+    return {
+        "artifacts": [
+            artifact.as_dict()
+            for artifact in artifact_manager.list(str(chat_id))
+        ]
+    }
+
+@app.get("/api/artifacts/{artifact_id}")
+async def api_artifact(
+    artifact_id: str,
+    chat_id: str = "web",
+    x_eval_token: str | None = Header(default=None),
+) -> FileResponse:
+    _require_eval_token(x_eval_token)
+
+    artifact = artifact_manager.get(str(chat_id), artifact_id)
+
+    if artifact is None or not artifact.path.exists():
+        raise HTTPException(status_code=404, detail="Artifact not found.")
+
+    return FileResponse(
+        path=str(artifact.path),
+        media_type=artifact.media_type,
+        filename=artifact.filename,
+    )
